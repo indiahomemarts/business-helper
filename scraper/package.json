@@ -7,7 +7,8 @@
     "scrape:orders-ndr": "tsx src/scrapeOrdersNdr.ts",
     "scrape:rto": "tsx src/scrapeRto.ts",
     "scrape:tickets-chat": "tsx src/scrapeTicketsChat.ts",
-    "reconcile:missing-parcels": "tsx src/reconcileMissingParcels.ts"
+    "reconcile:missing-parcels": "tsx src/reconcileMissingParcels.ts",
+    "debug:fetch-orders": "tsx src/debugFetchOrders.ts"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.0",
