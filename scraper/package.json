@@ -1,0 +1,21 @@
+{
+  "name": "shopdeck-scraper",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "scrape:orders-ndr": "tsx src/scrapeOrdersNdr.ts",
+    "scrape:rto": "tsx src/scrapeRto.ts",
+    "scrape:tickets-chat": "tsx src/scrapeTicketsChat.ts",
+    "reconcile:missing-parcels": "tsx src/reconcileMissingParcels.ts"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.0",
+    "playwright": "^1.47.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.0",
+    "typescript": "^5.5.0",
+    "@types/node": "^20.14.0"
+  }
+}
