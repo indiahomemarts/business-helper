@@ -1,16 +1,15 @@
 /**
- * Scrapes /orders/track-orders/all-orders, upserts order rows, and records
- * NDR attempt history so the "fake 3rd attempt" alert can fire.
- *
- * SELECTORS BELOW ARE BEST-EFFORT PLACEHOLDERS. They were written without
- * access to your logged-in ShopDeck account, so they will very likely need
- * adjusting after your first real run. Search this file for "ADJUST" for
- * every spot that needs a look. The easiest way to fix them:
- *   1. Log into ShopDeck in Chrome, open the all-orders page.
- *   2. Right-click a row -> Inspect, and note the actual tag/class structure.
- *   3. Update the selectors below to match, or share the HTML with Claude.
+ * Scrapes ShopDeck Orders & NDR attempts via real API interception & browsing,
+ * upserts order rows into Supabase in high-performance batches,
+ * and detects "fake 3rd attempt" anomalies.
  */
-import { openAuthenticatedContext, assertNotLoggedOut, markScrapeResult, SHOPDECK_BASE } from "./shopdeckSession.js";
+import {
+  openAuthenticatedContext,
+  assertNotLoggedOut,
+  markScrapeResult,
+  SHOPDECK_BASE,
+  SessionExpiredError,
+} from "./shopdeckSession.js";
 import { logCandidateJsonApis } from "./networkSniffer.js";
 import { raiseAlert } from "./apiClient.js";
 import { supabase } from "./supabaseClient.js";
@@ -22,63 +21,148 @@ interface ScrapedOrder {
   customerName: string | null;
   orderStatus: string | null;
   rtoStatus: string | null;
+  attemptNumber?: number | null;
 }
 
-function extractAttemptNumber(statusText: string | null): number | null {
+function extractAttemptNumber(statusText: string | null | undefined): number | null {
   if (!statusText) return null;
-  // ADJUST: matches things like "NDR - 3rd Attempt", "Attempt 2", "2nd attempt".
   const match = statusText.match(/attempt\s*[:#]?\s*(\d)/i) || statusText.match(/(\d)(?:st|nd|rd|th)\s*attempt/i);
   return match ? parseInt(match[1], 10) : null;
 }
 
-async function scrapeOrdersPage(): Promise<ScrapedOrder[]> {
+async function scrapeOrdersAndNdr(): Promise<ScrapedOrder[]> {
   const { browser, context } = await openAuthenticatedContext();
   const page = await context.newPage();
-
-  // Logs any JSON API calls ShopDeck's own frontend makes while this page
-  // loads — check your Action run logs to find a better data source later.
   logCandidateJsonApis(page, /order|track|ndr/i);
 
+  const collectedOrders: Map<string, ScrapedOrder> = new Map();
+  let sessionValid = false;
+
+  page.on("response", async (res) => {
+    const url = res.url();
+    const status = res.status();
+
+    if (status === 401) {
+      console.warn(`[API 401] Unauthorized on ${url}`);
+      return;
+    }
+
+    if (status === 200) {
+      sessionValid = true;
+
+      // Handle All Orders API response
+      if (url.includes("/api/order-process/orders")) {
+        try {
+          const json = await res.json();
+          const items = json?.data?.data || [];
+          for (const item of items) {
+            const awb = item.shipping_details?.awb_no?.trim();
+            if (!awb) continue;
+            collectedOrders.set(awb, {
+              awbNumber: awb,
+              orderId: item.order_details?.order_id?.trim() || null,
+              customerName: item.customer_details?.name?.trim() || null,
+              orderStatus: item.order_status?.status?.label || item.order_status?.label || null,
+              rtoStatus: normalizeRtoStatus(item.order_status?.status?.label || null),
+            });
+          }
+        } catch (e) {
+          console.error("Error parsing orders response:", e);
+        }
+      }
+
+      // Handle NDR API response
+      if (url.includes("/api/non-deliverables/ndr")) {
+        try {
+          const json = await res.json();
+          const items = json?.data?.data || [];
+          for (const item of items) {
+            const awb = item.shipping_details?.awb_no?.trim();
+            if (!awb) continue;
+            const attemptCount =
+              Number(item.ndr_info?.attempt_count) ||
+              extractAttemptNumber(item.ndr_info?.ndr_reason) ||
+              null;
+            const reason = item.ndr_info?.ndr_reason;
+            const statusLabel = reason ? `NDR - ${reason}` : "NDR Pending";
+
+            const existing = collectedOrders.get(awb);
+            collectedOrders.set(awb, {
+              awbNumber: awb,
+              orderId: item.order_details?.order_id?.trim() || existing?.orderId || null,
+              customerName: item.customer_details?.name?.trim() || existing?.customerName || null,
+              orderStatus: statusLabel,
+              rtoStatus: existing?.rtoStatus || null,
+              attemptNumber: attemptCount,
+            });
+          }
+        } catch (e) {
+          console.error("Error parsing NDR response:", e);
+        }
+      }
+    }
+  });
+
   try {
+    // 1. Visit Track Orders page
+    console.log("Navigating to track orders page...");
     await page.goto(`${SHOPDECK_BASE}/orders/track-orders/all-orders`, {
       waitUntil: "networkidle",
       timeout: 45_000,
     });
     assertNotLoggedOut(page.url());
+    await page.waitForTimeout(2000);
 
-    // ADJUST: wait for whatever element actually indicates the table has
-    // loaded. "table tbody tr" is a generic guess.
-    await page.waitForSelector("table tbody tr", { timeout: 15_000 }).catch(() => {
-      throw new Error("Orders table never appeared — page structure may differ from expectations.");
-    });
+    // 2. Fetch wider 30-day orders list directly via authenticated context request
+    try {
+      const now = new Date();
+      const endDate = now.toISOString().slice(0, 10);
+      const startDate = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
 
-    const rows = await page.$$("table tbody tr");
-    const orders: ScrapedOrder[] = [];
-
-    for (const row of rows) {
-      // ADJUST: these cell selectors assume a plain <td> table. Replace with
-      // whatever actually holds each value (could be nested divs/spans).
-      const cells = await row.$$("td");
-      const cellTexts = await Promise.all(cells.map((c) => c.innerText()));
-
-      // ADJUST: this column-index guess is almost certainly wrong for your
-      // real table. A more resilient alternative: read the table's <thead>
-      // once, match column names ("AWB", "Order ID", "Status", ...) by text,
-      // and look up cellTexts by that resolved index instead of a fixed one.
-      const [orderId, awbNumber, customerName, orderStatus, rtoStatus] = cellTexts;
-
-      if (!awbNumber?.trim()) continue;
-
-      orders.push({
-        awbNumber: awbNumber.trim(),
-        orderId: orderId?.trim() || null,
-        customerName: customerName?.trim() || null,
-        orderStatus: orderStatus?.trim() || null,
-        rtoStatus: rtoStatus?.trim() || null,
+      const res = await context.request.post(`${SHOPDECK_BASE}/api/order-process/orders`, {
+        data: {
+          page_no: 0,
+          page_size: 100,
+          filters: { start_date: startDate, end_date: endDate },
+          sort: "desc",
+        },
       });
+
+      if (res.status() === 200) {
+        sessionValid = true;
+        const json = await res.json();
+        const items = json?.data?.data || [];
+        for (const item of items) {
+          const awb = item.shipping_details?.awb_no?.trim();
+          if (!awb) continue;
+          if (!collectedOrders.has(awb)) {
+            collectedOrders.set(awb, {
+              awbNumber: awb,
+              orderId: item.order_details?.order_id?.trim() || null,
+              customerName: item.customer_details?.name?.trim() || null,
+              orderStatus: item.order_status?.status?.label || item.order_status?.label || null,
+              rtoStatus: normalizeRtoStatus(item.order_status?.status?.label || null),
+            });
+          }
+        }
+      }
+    } catch (err) {
+      console.warn("Direct 30-day orders fetch note:", err);
     }
 
-    return orders;
+    // 3. Visit NDR page
+    console.log("Navigating to NDR page...");
+    await page.goto(`${SHOPDECK_BASE}/orders/ndr`, {
+      waitUntil: "networkidle",
+      timeout: 45_000,
+    }).catch((e) => console.warn("NDR page navigation note:", e.message));
+    await page.waitForTimeout(2000);
+
+    if (!sessionValid && collectedOrders.size === 0) {
+      throw new SessionExpiredError("ShopDeck session returned no valid order data.");
+    }
+
+    return Array.from(collectedOrders.values());
   } finally {
     await context.close();
     await browser.close();
@@ -86,49 +170,84 @@ async function scrapeOrdersPage(): Promise<ScrapedOrder[]> {
 }
 
 async function persistOrdersAndDetectFakeAttempts(orders: ScrapedOrder[]) {
-  for (const o of orders) {
-    await supabase.from("orders").upsert({
-      awb_number: o.awbNumber,
-      order_id: o.orderId,
-      customer_name: o.customerName,
-      order_status: o.orderStatus,
-      rto_status: normalizeRtoStatus(o.rtoStatus || o.orderStatus),
-      last_seen_at: new Date().toISOString(),
-    });
+  if (orders.length === 0) return;
 
-    const attemptNumber = extractAttemptNumber(o.orderStatus);
-    if (attemptNumber === null) continue;
+  // 1. Batch upsert orders
+  const ordersPayload = orders.map((o) => ({
+    awb_number: o.awbNumber,
+    order_id: o.orderId,
+    customer_name: o.customerName,
+    order_status: o.orderStatus,
+    rto_status: o.rtoStatus,
+    last_seen_at: new Date().toISOString(),
+  }));
 
+  const { error: upsertErr } = await supabase.from("orders").upsert(ordersPayload, {
+    onConflict: "awb_number",
+  });
+  if (upsertErr) console.error("Error batch upserting orders:", upsertErr);
+
+  // 2. Process NDR attempt histories in batch
+  const ordersWithAttempts = orders
+    .map((o) => ({
+      awbNumber: o.awbNumber,
+      attemptNumber: o.attemptNumber || extractAttemptNumber(o.orderStatus),
+    }))
+    .filter((o): o is { awbNumber: string; attemptNumber: number } => o.attemptNumber !== null && !isNaN(o.attemptNumber));
+
+  if (ordersWithAttempts.length > 0) {
+    const awbs = Array.from(new Set(ordersWithAttempts.map((o) => o.awbNumber)));
     const { data: existingAttempts } = await supabase
       .from("ndr_attempt_history")
-      .select("attempt_number")
-      .eq("awb_number", o.awbNumber);
+      .select("awb_number, attempt_number")
+      .in("awb_number", awbs);
 
-    const seenNumbers = new Set((existingAttempts || []).map((r) => r.attempt_number));
-    if (seenNumbers.has(attemptNumber)) continue; // already recorded, nothing new
+    const existingMap = new Map<string, Set<number>>();
+    for (const row of existingAttempts || []) {
+      if (!existingMap.has(row.awb_number)) {
+        existingMap.set(row.awb_number, new Set());
+      }
+      existingMap.get(row.awb_number)!.add(row.attempt_number);
+    }
 
-    await supabase.from("ndr_attempt_history").insert({
-      awb_number: o.awbNumber,
-      attempt_number: attemptNumber,
-    });
+    const newAttemptsToInsert: Array<{ awb_number: string; attempt_number: number }> = [];
 
-    const isFakeThirdAttempt = attemptNumber === 3 && !seenNumbers.has(1) && !seenNumbers.has(2);
-    if (isFakeThirdAttempt) {
-      await raiseAlert({
-        type: "fake_attempt",
-        awb_number: o.awbNumber,
-        title: `AWB ${o.awbNumber}: 3rd attempt shown with no history`,
-        alertBody:
-          "ShopDeck shows this as a 3rd delivery attempt, but our records never saw a 1st or 2nd attempt for it. Worth double-checking with the logistics team.",
-      });
+    for (const item of ordersWithAttempts) {
+      const seen = existingMap.get(item.awbNumber) || new Set<number>();
+      if (!seen.has(item.attemptNumber)) {
+        newAttemptsToInsert.push({
+          awb_number: item.awbNumber,
+          attempt_number: item.attemptNumber,
+        });
+        seen.add(item.attemptNumber);
+
+        // Detect fake 3rd attempt
+        const isFakeThird = item.attemptNumber === 3 && !seen.has(1) && !seen.has(2);
+        if (isFakeThird) {
+          await raiseAlert({
+            type: "fake_attempt",
+            awb_number: item.awbNumber,
+            title: `AWB ${item.awbNumber}: 3rd attempt shown with no history`,
+            alertBody:
+              "ShopDeck shows this as a 3rd delivery attempt, but our records never saw a 1st or 2nd attempt for it. Worth double-checking with the logistics team.",
+          });
+        }
+      }
+    }
+
+    if (newAttemptsToInsert.length > 0) {
+      const { error: insertErr } = await supabase
+        .from("ndr_attempt_history")
+        .insert(newAttemptsToInsert);
+      if (insertErr) console.error("Error inserting NDR attempts:", insertErr);
     }
   }
 }
 
 async function main() {
   try {
-    const orders = await scrapeOrdersPage();
-    console.log(`Scraped ${orders.length} orders.`);
+    const orders = await scrapeOrdersAndNdr();
+    console.log(`Scraped ${orders.length} orders/NDR entries.`);
     await persistOrdersAndDetectFakeAttempts(orders);
     await markScrapeResult("last_scrape_orders_ndr", true);
   } catch (err) {

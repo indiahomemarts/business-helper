@@ -1,20 +1,12 @@
 /**
- * The scraper does NOT send push notifications or call Gemini directly — it
- * asks the deployed Next.js app to do that, so there's exactly one place
- * (lib/push.ts and lib/gemini.ts in the main app) that owns those side
- * effects. This keeps the scraper a thin "collect data" layer.
+ * The scraper notifies the deployed Next.js app to send Web Push notifications
+ * and run Gemini AI evaluations. If APP_URL is not configured (e.g. during local runs),
+ * alerts are persisted directly to Supabase as a fallback.
  */
+import { supabase } from "./supabaseClient.js";
 
 const APP_URL = process.env.APP_URL; // e.g. https://your-app.vercel.app
 const SECRET = process.env.INTERNAL_API_SECRET;
-
-function assertConfigured() {
-  if (!APP_URL || !SECRET) {
-    throw new Error(
-      "Missing APP_URL or INTERNAL_API_SECRET. Set these as GitHub Actions secrets."
-    );
-  }
-}
 
 export type AlertType =
   | "fake_attempt"
@@ -31,35 +23,60 @@ export async function raiseAlert(alert: {
   title: string;
   alertBody?: string;
 }) {
-  assertConfigured();
-  const res = await fetch(`${APP_URL}/api/cron/raise-alert`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${SECRET}`,
-    },
-    body: JSON.stringify(alert),
-  });
-  if (!res.ok) {
-    console.error("raiseAlert failed:", res.status, await res.text().catch(() => ""));
+  if (APP_URL && SECRET) {
+    try {
+      const res = await fetch(`${APP_URL}/api/cron/raise-alert`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${SECRET}`,
+        },
+        body: JSON.stringify(alert),
+      });
+      if (res.ok) return;
+      console.warn("raiseAlert HTTP failed, falling back to direct DB insert:", res.status);
+    } catch (err: any) {
+      console.warn("raiseAlert fetch failed, falling back to direct DB insert:", err.message);
+    }
+  }
+
+  // Fallback: insert directly into Supabase alerts table
+  try {
+    await supabase.from("alerts").insert({
+      type: alert.type,
+      awb_number: alert.awb_number || null,
+      ticket_id: alert.ticket_id || null,
+      title: alert.title,
+      body: alert.alertBody || null,
+      is_read: false,
+    });
+  } catch (dbErr) {
+    console.error("Failed to insert alert into Supabase:", dbErr);
   }
 }
 
 export async function evaluateResolution(ticketId: string) {
-  assertConfigured();
-  const res = await fetch(`${APP_URL}/api/cron/evaluate-resolution`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${SECRET}`,
-    },
-    body: JSON.stringify({ ticket_id: ticketId }),
-  });
-  if (!res.ok) {
-    console.error(
-      "evaluateResolution failed:",
-      res.status,
-      await res.text().catch(() => "")
-    );
+  if (!APP_URL || !SECRET) {
+    console.log(`[evaluateResolution] Skipped webhook (APP_URL or INTERNAL_API_SECRET not set) for ticket #${ticketId}`);
+    return;
+  }
+  try {
+    const res = await fetch(`${APP_URL}/api/cron/evaluate-resolution`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${SECRET}`,
+      },
+      body: JSON.stringify({ ticket_id: ticketId }),
+    });
+    if (!res.ok) {
+      console.error(
+        "evaluateResolution failed:",
+        res.status,
+        await res.text().catch(() => "")
+      );
+    }
+  } catch (err: any) {
+    console.error("evaluateResolution network error:", err.message);
   }
 }

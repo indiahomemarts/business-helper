@@ -81,7 +81,7 @@ only in encrypted GitHub Secrets, so this is safe).
 
 ```bash
 cd shopdeck-assistant
-git remote add origin https://github.com/YOUR_USERNAME/shopdeck-assistant.git
+git remote add origin https://github.com/indiahomemarts/business-helper.git
 git branch -M main
 git push -u origin main
 ```

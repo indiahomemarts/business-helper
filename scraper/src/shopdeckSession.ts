@@ -1,18 +1,19 @@
-import { chromium, type Browser, type BrowserContext } from "playwright";
+import { chromium, type Browser, type BrowserContext, type Page } from "playwright";
 import { supabase } from "./supabaseClient.js";
 
 export const SHOPDECK_BASE = "https://pro.shopdeck.com";
 const SHOPDECK_DOMAIN = ".shopdeck.com";
 
+export const SHOPDECK_HEADERS = {
+  "wm_lang": "en",
+  "wm_web_version": "7.4",
+  "wm_platform": "dashboard",
+};
+
 /**
- * The Settings page asks the user to paste the FULL "Cookie" request header
- * value from their browser's DevTools (Network tab -> any request to
- * pro.shopdeck.com -> Headers -> "cookie") rather than a single named
- * cookie, because we don't know in advance which cookie name(s) ShopDeck
- * actually uses for the session. This parses that raw header string into
- * individual cookies Playwright can set on the browser context.
+ * Parses raw Cookie header string into individual cookies Playwright can set on the browser context.
  */
-function parseCookieHeader(raw: string) {
+export function parseCookieHeader(raw: string) {
   return raw
     .split(";")
     .map((pair) => pair.trim())
@@ -31,8 +32,8 @@ function parseCookieHeader(raw: string) {
 }
 
 export class SessionExpiredError extends Error {
-  constructor() {
-    super("ShopDeck session appears to be expired or invalid.");
+  constructor(message = "ShopDeck session appears to be expired or invalid.") {
+    super(message);
     this.name = "SessionExpiredError";
   }
 }
@@ -46,7 +47,7 @@ export async function getShopdeckCookie(): Promise<string> {
 
   if (error) throw error;
   if (!data?.value) {
-    throw new SessionExpiredError();
+    throw new SessionExpiredError("No ShopDeck cookie configured in settings.");
   }
   return data.value;
 }
@@ -63,7 +64,7 @@ export async function markScrapeResult(
 }
 
 /**
- * Opens a browser context pre-authenticated with the stored ShopDeck cookie.
+ * Opens a browser context pre-authenticated with the stored ShopDeck cookie and custom headers.
  * Caller is responsible for calling context.close() / browser.close().
  */
 export async function openAuthenticatedContext(): Promise<{
@@ -76,7 +77,9 @@ export async function openAuthenticatedContext(): Promise<{
   const browser = await chromium.launch({ headless: true });
   const context = await browser.newContext({
     userAgent:
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    viewport: { width: 1440, height: 900 },
+    extraHTTPHeaders: SHOPDECK_HEADERS,
   });
   await context.addCookies(cookies);
 
@@ -84,14 +87,10 @@ export async function openAuthenticatedContext(): Promise<{
 }
 
 /**
- * Call this right after navigating to a ShopDeck page. Most dashboards
- * redirect to a /login (or similar) URL when the session is invalid — adjust
- * the substring check below once you've seen ShopDeck's real login URL.
+ * Validates the page is logged in and not redirected to a login/auth page.
  */
 export function assertNotLoggedOut(currentUrl: string) {
-  // ADJUST: confirm the exact login path ShopDeck redirects to and refine
-  // this check (e.g. it might be "/login", "/auth", "/signin", etc.)
-  if (/login|signin|auth/i.test(currentUrl) && !currentUrl.includes(SHOPDECK_BASE + "/orders")) {
-    throw new SessionExpiredError();
+  if (/\/login|\/signin|\/auth/i.test(currentUrl) && !currentUrl.includes("/orders")) {
+    throw new SessionExpiredError(`Redirected to login: ${currentUrl}`);
   }
 }

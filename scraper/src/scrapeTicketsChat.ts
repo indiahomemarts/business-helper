@@ -1,14 +1,15 @@
 /**
- * Scrapes ticket status from /seller-support/tickets-new and messages from
- * /seller-chat. Same placeholder-selector caveat as the other scrapers —
- * search for "ADJUST". This one also makes an assumption worth checking on
- * your first real run: that each chat thread on /seller-chat is identified
- * by (or links to) the same ticket_id shown on the tickets page. If
- * ShopDeck's chat is structured differently (e.g. chats aren't 1:1 with
- * tickets), this will need rethinking together once you can see the real
- * page.
+ * Scrapes ticket status from /seller-support/tickets-new and messages from /seller-chat
+ * via real API interception and browsing, persists them in Supabase in batch,
+ * and triggers AI resolution evaluation & new message alerts.
  */
-import { openAuthenticatedContext, assertNotLoggedOut, markScrapeResult, SHOPDECK_BASE } from "./shopdeckSession.js";
+import {
+  openAuthenticatedContext,
+  assertNotLoggedOut,
+  markScrapeResult,
+  SHOPDECK_BASE,
+  SessionExpiredError,
+} from "./shopdeckSession.js";
 import { logCandidateJsonApis } from "./networkSniffer.js";
 import { raiseAlert, evaluateResolution } from "./apiClient.js";
 import { supabase } from "./supabaseClient.js";
@@ -17,95 +18,151 @@ interface ScrapedTicket {
   ticketId: string;
   subject: string | null;
   status: "open" | "closed";
+  openedAt?: string | null;
+  closedAt?: string | null;
 }
 
 interface ScrapedMessage {
   ticketId: string;
   sender: "agent" | "seller";
   message: string;
+  sentAt?: string | null;
 }
 
-async function scrapeTickets(): Promise<ScrapedTicket[]> {
+function parseDateStr(str: string | null | undefined): string | null {
+  if (!str) return null;
+  try {
+    const cleaned = str.replace("•", "").trim();
+    const parsed = new Date(cleaned);
+    return isNaN(parsed.getTime()) ? null : parsed.toISOString();
+  } catch {
+    return null;
+  }
+}
+
+async function scrapeTicketsAndChat(): Promise<{
+  tickets: ScrapedTicket[];
+  messages: ScrapedMessage[];
+}> {
   const { browser, context } = await openAuthenticatedContext();
   const page = await context.newPage();
-  logCandidateJsonApis(page, /ticket|support/i);
+  logCandidateJsonApis(page, /ticket|support|chat|message/i);
+
+  const collectedTickets: Map<string, ScrapedTicket> = new Map();
+  const collectedMessages: ScrapedMessage[] = [];
+  let sessionValid = false;
+
+  page.on("response", async (res) => {
+    const url = res.url();
+    const status = res.status();
+
+    if (status === 200) {
+      sessionValid = true;
+
+      // 1. Handle Tickets API response
+      if (url.includes("/customer-support-ticket/sales-force-tickets")) {
+        try {
+          const json = await res.json();
+          const items = json?.data?.tickets || [];
+          for (const t of items) {
+            const id = String(t.ticket_id || t.internal_ticket_id || "").trim();
+            if (!id) continue;
+
+            const isClosed =
+              Boolean(t.is_ticket_closed) ||
+              /completed|closed/i.test(t.status?.label || "");
+
+            collectedTickets.set(id, {
+              ticketId: id,
+              subject: t.title || t.issue || null,
+              status: isClosed ? "closed" : "open",
+              openedAt: parseDateStr(t.date),
+              closedAt: isClosed ? parseDateStr(t.ticket_closed_at) || new Date().toISOString() : null,
+            });
+          }
+        } catch (e) {
+          console.error("Error parsing tickets response:", e);
+        }
+      }
+
+      // 2. Handle Chat Messages API response
+      if (url.includes("/seller-chats/chat/messages")) {
+        try {
+          const json = await res.json();
+          const events = json?.chat_events || [];
+          for (const ev of events) {
+            if (ev.event_type !== "message") continue;
+
+            let content = (ev.content || "").trim();
+            const sender: ScrapedMessage["sender"] =
+              ev.sender_type === "seller" ? "seller" : "agent";
+            const sentAt = ev.timestamp ? new Date(ev.timestamp).toISOString() : new Date().toISOString();
+
+            // Check if ticket number is embedded in message or context
+            let ticketId = ev.context?.ticket?.number || "";
+            if (!ticketId) {
+              const ticketMatch = content.match(/#?(\d{6})/);
+              if (ticketMatch) {
+                ticketId = ticketMatch[1];
+              }
+            }
+
+            if (!content && ev.context?.ticket?.title) {
+              content = `${ev.context.ticket.title} (Ticket #${ev.context.ticket.number})`;
+            }
+
+            if (content) {
+              collectedMessages.push({
+                ticketId: ticketId || "general",
+                sender,
+                message: content,
+                sentAt,
+              });
+            }
+          }
+        } catch (e) {
+          console.error("Error parsing chat response:", e);
+        }
+      }
+    }
+  });
 
   try {
+    // 1. Visit Tickets page
+    console.log("Navigating to tickets page...");
     await page.goto(`${SHOPDECK_BASE}/seller-support/tickets-new`, {
       waitUntil: "networkidle",
       timeout: 45_000,
     });
     assertNotLoggedOut(page.url());
+    await page.waitForTimeout(2000);
 
-    await page.waitForSelector("table tbody tr, [class*='ticket-row']", { timeout: 15_000 }).catch(() => {
-      throw new Error("Ticket list never appeared — page structure may differ from expectations.");
-    });
+    // 2. Visit Seller Chat page
+    console.log("Navigating to seller chat page...");
+    await page.goto(`${SHOPDECK_BASE}/seller-chat`, {
+      waitUntil: "networkidle",
+      timeout: 45_000,
+    }).catch((e) => console.warn("Chat page navigation note:", e.message));
+    await page.waitForTimeout(2000);
 
-    // ADJUST: this assumes a table; ShopDeck may instead render a list of
-    // cards. If so, replace this whole block with page.$$('[class*="ticket-row"]')
-    // and adjust the per-row extraction below to match.
-    const rows = await page.$$("table tbody tr");
-    const tickets: ScrapedTicket[] = [];
+    // Fallback: If chat messages had "general" ticketId, map them to known tickets
+    const knownTicketIds = Array.from(collectedTickets.keys());
+    const latestTicketId = knownTicketIds[0] || null;
 
-    for (const row of rows) {
-      const cells = await row.$$("td");
-      const cellTexts = await Promise.all(cells.map((c) => c.innerText()));
-      // ADJUST: column-index guess.
-      const [ticketId, subject, statusText] = cellTexts;
-      if (!ticketId?.trim()) continue;
-
-      tickets.push({
-        ticketId: ticketId.trim(),
-        subject: subject?.trim() || null,
-        status: /closed/i.test(statusText || "") ? "closed" : "open",
-      });
-    }
-
-    return tickets;
-  } finally {
-    await context.close();
-    await browser.close();
-  }
-}
-
-async function scrapeChatMessages(ticketIds: string[]): Promise<ScrapedMessage[]> {
-  const { browser, context } = await openAuthenticatedContext();
-  const page = await context.newPage();
-  logCandidateJsonApis(page, /chat|message/i);
-  const allMessages: ScrapedMessage[] = [];
-
-  try {
-    await page.goto(`${SHOPDECK_BASE}/seller-chat`, { waitUntil: "networkidle", timeout: 45_000 });
-    assertNotLoggedOut(page.url());
-
-    // ADJUST: entirely best-effort. This assumes clicking a thread whose
-    // visible text contains the ticket ID opens that conversation, and that
-    // messages render as elements with a "sent by me" vs "sent by them"
-    // visual distinction we can key off of (commonly a CSS class or
-    // alignment). Replace with real selectors once you can see the DOM.
-    for (const ticketId of ticketIds) {
-      const threadLink = page.getByText(ticketId, { exact: false }).first();
-      const count = await threadLink.count();
-      if (count === 0) continue;
-
-      await threadLink.click();
-      await page.waitForTimeout(1000);
-
-      const messageEls = await page.$$("[class*='message'], [class*='chat-bubble']");
-      for (const el of messageEls) {
-        const text = (await el.innerText()).trim();
-        if (!text) continue;
-        // ADJUST: guessing "agent"/"seller" from a class name. Replace with
-        // whatever ShopDeck actually uses to distinguish sender.
-        const className = (await el.getAttribute("class")) || "";
-        const sender: ScrapedMessage["sender"] = /agent|support|admin/i.test(className)
-          ? "agent"
-          : "seller";
-        allMessages.push({ ticketId, sender, message: text });
+    for (const m of collectedMessages) {
+      if (m.ticketId === "general" && latestTicketId) {
+        m.ticketId = latestTicketId;
       }
     }
 
-    return allMessages;
+    if (!sessionValid && collectedTickets.size === 0) {
+      throw new SessionExpiredError("ShopDeck session returned no valid ticket data.");
+    }
+
+    return {
+      tickets: Array.from(collectedTickets.values()),
+      messages: collectedMessages,
+    };
   } finally {
     await context.close();
     await browser.close();
@@ -113,66 +170,79 @@ async function scrapeChatMessages(ticketIds: string[]): Promise<ScrapedMessage[]
 }
 
 async function persistTicketsAndDetectTransitions(scraped: ScrapedTicket[]) {
+  if (scraped.length === 0) return;
+
   const { data: existing } = await supabase.from("tickets").select("ticket_id, status");
   const previousStatus = new Map((existing || []).map((t) => [t.ticket_id, t.status]));
+
+  const payload = scraped.map((t) => ({
+    ticket_id: t.ticketId,
+    subject: t.subject,
+    status: t.status,
+    opened_at: t.openedAt || undefined,
+    closed_at: t.closedAt,
+    last_synced_at: new Date().toISOString(),
+  }));
+
+  const { error } = await supabase.from("tickets").upsert(payload, {
+    onConflict: "ticket_id",
+  });
+  if (error) console.error("Error batch upserting tickets:", error);
 
   for (const t of scraped) {
     const wasOpen = previousStatus.get(t.ticketId) === "open";
     const justClosed = wasOpen && t.status === "closed";
 
-    await supabase.from("tickets").upsert({
-      ticket_id: t.ticketId,
-      subject: t.subject,
-      status: t.status,
-      closed_at: t.status === "closed" ? new Date().toISOString() : null,
-      last_synced_at: new Date().toISOString(),
-    });
-
     if (justClosed) {
-      // Ask the main app to run the AI resolution check + raise the right alert.
+      // Trigger AI resolution check
       await evaluateResolution(t.ticketId);
     }
   }
 }
 
 async function persistNewMessagesAndAlert(messages: ScrapedMessage[]) {
-  for (const m of messages) {
-    // Avoid inserting the same message twice on repeated 5-minute runs.
-    const { data: dup } = await supabase
-      .from("chat_history")
-      .select("id")
-      .eq("ticket_id", m.ticketId)
-      .eq("sender", m.sender)
-      .eq("message", m.message)
-      .limit(1);
+  const valid = messages.filter((m) => m.ticketId && m.ticketId !== "general");
+  if (valid.length === 0) return;
 
-    if (dup && dup.length > 0) continue;
+  const ticketIds = Array.from(new Set(valid.map((m) => m.ticketId)));
+  const { data: existing } = await supabase
+    .from("chat_history")
+    .select("ticket_id, sender, message")
+    .in("ticket_id", ticketIds);
 
-    await supabase.from("chat_history").insert({
-      ticket_id: m.ticketId,
-      sender: m.sender,
-      message: m.message,
-    });
+  const existingSet = new Set((existing || []).map((m) => `${m.ticket_id}|${m.sender}|${m.message}`));
+  const toInsert = valid.filter((m) => !existingSet.has(`${m.ticketId}|${m.sender}|${m.message}`));
 
-    if (m.sender === "agent") {
-      await raiseAlert({
-        type: "new_agent_message",
+  if (toInsert.length > 0) {
+    const { error } = await supabase.from("chat_history").insert(
+      toInsert.map((m) => ({
         ticket_id: m.ticketId,
-        title: `New message on ticket #${m.ticketId}`,
-        alertBody: m.message.slice(0, 140),
-      });
+        sender: m.sender,
+        message: m.message,
+        sent_at: m.sentAt || new Date().toISOString(),
+      }))
+    );
+    if (error) console.error("Error inserting chat history:", error);
+
+    for (const m of toInsert) {
+      if (m.sender === "agent") {
+        await raiseAlert({
+          type: "new_agent_message",
+          ticket_id: m.ticketId,
+          title: `New message on ticket #${m.ticketId}`,
+          alertBody: m.message.slice(0, 140),
+        });
+      }
     }
   }
 }
 
 async function main() {
   try {
-    const tickets = await scrapeTickets();
-    console.log(`Scraped ${tickets.length} tickets.`);
-    await persistTicketsAndDetectTransitions(tickets);
+    const { tickets, messages } = await scrapeTicketsAndChat();
+    console.log(`Scraped ${tickets.length} tickets and ${messages.length} messages.`);
 
-    const messages = await scrapeChatMessages(tickets.map((t) => t.ticketId));
-    console.log(`Scraped ${messages.length} chat messages.`);
+    await persistTicketsAndDetectTransitions(tickets);
     await persistNewMessagesAndAlert(messages);
 
     await markScrapeResult("last_scrape_tickets_chat", true);

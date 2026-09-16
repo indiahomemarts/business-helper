@@ -19,3 +19,7 @@ npm-debug.log*
 # playwright
 scraper/test-results/
 scraper/playwright-report/
+
+# build info
+*.tsbuildinfo
+

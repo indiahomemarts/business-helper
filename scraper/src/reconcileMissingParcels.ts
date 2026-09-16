@@ -3,10 +3,6 @@
  * Compares parcels ShopDeck shows as delivered/RTO-delivered against what's
  * been physically scanned in via the RTO inwarding flow, and raises a
  * Missing Parcel alert for anything that hasn't been scanned in.
- *
- * This does NOT scrape ShopDeck itself — it reads whatever the orders/RTO
- * scrapers already wrote to Supabase earlier today, so make sure those are
- * scheduled to run before this one (see the workflow files).
  */
 import { supabase } from "./supabaseClient.js";
 import { raiseAlert } from "./apiClient.js";
@@ -38,19 +34,23 @@ async function main() {
 
   console.log(`Checked ${deliveredOrders?.length || 0} delivered orders, ${missing.length} missing.`);
 
-  for (const m of missing) {
-    // Check we haven't already alerted on this AWB today, to avoid spamming
-    // the same notification every day it stays unresolved.
-    const today = new Date().toISOString().slice(0, 10);
-    const { data: existingAlert } = await supabase
-      .from("alerts")
-      .select("id")
-      .eq("type", "missing_parcel")
-      .eq("awb_number", m.awb_number)
-      .gte("created_at", `${today}T00:00:00Z`)
-      .limit(1);
+  if (missing.length === 0) return;
 
-    if (existingAlert && existingAlert.length > 0) continue;
+  const today = new Date().toISOString().slice(0, 10);
+  const missingAwbs = missing.map((m) => m.awb_number);
+
+  // Batch query existing alerts for today
+  const { data: existingAlerts } = await supabase
+    .from("alerts")
+    .select("awb_number")
+    .eq("type", "missing_parcel")
+    .in("awb_number", missingAwbs)
+    .gte("created_at", `${today}T00:00:00Z`);
+
+  const alertedSet = new Set((existingAlerts || []).map((a) => a.awb_number));
+
+  for (const m of missing) {
+    if (alertedSet.has(m.awb_number)) continue;
 
     await raiseAlert({
       type: "missing_parcel",
