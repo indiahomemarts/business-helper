@@ -34,7 +34,17 @@ const TYPE_META: Record<
   new_agent_message: {
     label: "New message",
     tone: "pending",
+    href: (a) => (a.ticket_id ? `/messages` : "/messages"),
+  },
+  ticket_closed_by_shopdeck: {
+    label: "ShopDeck closed ticket",
+    tone: "urgent",
     href: (a) => (a.ticket_id ? `/tickets?ticket=${a.ticket_id}` : "/tickets"),
+  },
+  intransit_dropped: {
+    label: "Missing in transit",
+    tone: "urgent",
+    href: (a) => (a.awb_number ? `/rto?awb=${a.awb_number}` : "/rto"),
   },
 };
 

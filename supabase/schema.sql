@@ -23,7 +23,9 @@ insert into settings (key, value) values
   ('shopdeck_cookie_updated_at', null),
   ('last_scrape_orders_ndr', null),
   ('last_scrape_tickets_chat', null),
-  ('last_scrape_ok', 'true')
+  ('last_scrape_ok', 'true'),
+  ('rto_initial_total', '0'),
+  ('rto_baseline_date', null)
 on conflict (key) do nothing;
 
 -- ============================================================
@@ -76,9 +78,10 @@ create table if not exists ndr_logs (
 );
 
 create index if not exists idx_ndr_logs_awb on ndr_logs(awb_number);
+create index if not exists idx_ndr_logs_called_at on ndr_logs(called_at desc);
 
 -- ============================================================
--- RTO PHYSICAL INWARDING — OTP-gated proof of physical receipt
+-- RTO PHYSICAL INWARDING — Proof of physical receipt with file upload
 -- ============================================================
 create table if not exists rto_inward_log (
   id bigint generated always as identity primary key,
@@ -88,6 +91,31 @@ create table if not exists rto_inward_log (
 );
 
 create unique index if not exists idx_rto_inward_awb on rto_inward_log(awb_number);
+
+-- Detailed inwarding entries including proof files (image/pdf) & time logs
+create table if not exists rto_inward_entries (
+  id bigint generated always as identity primary key,
+  awb_number text not null references orders(awb_number) on delete cascade,
+  file_path text,
+  file_name text,
+  file_type text,
+  notes text,
+  created_at timestamptz not null default now()
+);
+
+create index if not exists idx_rto_inward_entries_awb on rto_inward_entries(awb_number);
+create index if not exists idx_rto_inward_entries_created on rto_inward_entries(created_at desc);
+
+-- Tracking snapshots for in-transit parcels to detect drops/disappearances
+create table if not exists rto_intransit_history (
+  id bigint generated always as identity primary key,
+  awb_number text not null references orders(awb_number) on delete cascade,
+  last_status text,
+  disappeared_without_delivery boolean not null default false,
+  detected_at timestamptz not null default now()
+);
+
+create index if not exists idx_rto_intransit_awb on rto_intransit_history(awb_number);
 
 -- Short-lived OTP challenge, created when staff taps "Mark as received" and
 -- consumed when they enter the code that was pushed to the owner's phone.
@@ -129,14 +157,22 @@ create index if not exists idx_alerts_unread on alerts(is_read) where is_read = 
 -- ============================================================
 create table if not exists tickets (
   ticket_id text primary key,
-  status text not null default 'open', -- 'open' | 'closed'
+  status text not null default 'open', -- 'open' | 'closed' (ShopDeck status)
   subject text,
   opened_at timestamptz,
   closed_at timestamptz,
+  user_status text not null default 'open', -- 'open' | 'solved' (Manual status)
+  user_solved_at timestamptz,
+  is_closed_by_shopdeck boolean not null default false,
+  shopdeck_closed_at timestamptz,
+  has_chat_messages boolean not null default false,
   ai_resolution_flag text not null default 'unreviewed', -- 'resolved' | 'needs_review' | 'unreviewed'
   ai_resolution_reasoning text,
   last_synced_at timestamptz not null default now()
 );
+
+create index if not exists idx_tickets_user_status on tickets(user_status);
+create index if not exists idx_tickets_shopdeck_closed on tickets(is_closed_by_shopdeck);
 
 create table if not exists chat_history (
   id bigint generated always as identity primary key,
@@ -173,6 +209,8 @@ alter table orders enable row level security;
 alter table ndr_attempt_history enable row level security;
 alter table ndr_logs enable row level security;
 alter table rto_inward_log enable row level security;
+alter table rto_inward_entries enable row level security;
+alter table rto_intransit_history enable row level security;
 alter table alerts enable row level security;
 alter table tickets enable row level security;
 alter table chat_history enable row level security;
@@ -180,8 +218,9 @@ alter table chat_thread_summary enable row level security;
 alter table push_subscriptions enable row level security;
 
 -- ============================================================
--- Storage bucket for NDR call recordings
+-- Storage buckets
 -- ============================================================
 insert into storage.buckets (id, name, public)
-values ('ndr-recordings', 'ndr-recordings', false)
+values ('ndr-recordings', 'ndr-recordings', false),
+       ('rto-files', 'rto-files', true)
 on conflict (id) do nothing;

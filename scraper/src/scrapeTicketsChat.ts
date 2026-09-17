@@ -169,20 +169,32 @@ async function scrapeTicketsAndChat(): Promise<{
   }
 }
 
-async function persistTicketsAndDetectTransitions(scraped: ScrapedTicket[]) {
+async function persistTicketsAndDetectTransitions(scraped: ScrapedTicket[], messages: ScrapedMessage[]) {
   if (scraped.length === 0) return;
 
-  const { data: existing } = await supabase.from("tickets").select("ticket_id, status");
+  const { data: existing } = await supabase.from("tickets").select("ticket_id, status, is_closed_by_shopdeck");
   const previousStatus = new Map((existing || []).map((t) => [t.ticket_id, t.status]));
+  const previousClosed = new Map((existing || []).map((t) => [t.ticket_id, t.is_closed_by_shopdeck]));
 
-  const payload = scraped.map((t) => ({
-    ticket_id: t.ticketId,
-    subject: t.subject,
-    status: t.status,
-    opened_at: t.openedAt || undefined,
-    closed_at: t.closedAt,
-    last_synced_at: new Date().toISOString(),
-  }));
+  // Check which tickets have messages
+  const ticketsWithMessages = new Set(messages.map((m) => m.ticketId));
+
+  const payload = scraped.map((t) => {
+    const isClosed = t.status === "closed";
+    const hasChat = ticketsWithMessages.has(t.ticketId);
+
+    return {
+      ticket_id: t.ticketId,
+      subject: t.subject,
+      status: t.status,
+      opened_at: t.openedAt || undefined,
+      closed_at: t.closedAt,
+      is_closed_by_shopdeck: isClosed,
+      shopdeck_closed_at: isClosed ? t.closedAt || new Date().toISOString() : null,
+      has_chat_messages: hasChat,
+      last_synced_at: new Date().toISOString(),
+    };
+  });
 
   const { error } = await supabase.from("tickets").upsert(payload, {
     onConflict: "ticket_id",
@@ -191,9 +203,29 @@ async function persistTicketsAndDetectTransitions(scraped: ScrapedTicket[]) {
 
   for (const t of scraped) {
     const wasOpen = previousStatus.get(t.ticketId) === "open";
-    const justClosed = wasOpen && t.status === "closed";
+    const wasAlreadyClosed = previousClosed.get(t.ticketId) === true;
+    const justClosed = (wasOpen && t.status === "closed") || (!wasAlreadyClosed && t.status === "closed");
 
     if (justClosed) {
+      // Check if there are messages for this ticket in DB or in scraped batch
+      const { data: chatRows } = await supabase
+        .from("chat_history")
+        .select("id")
+        .eq("ticket_id", t.ticketId)
+        .limit(1);
+
+      const hasChat = (chatRows && chatRows.length > 0) || ticketsWithMessages.has(t.ticketId);
+
+      // Raise notification for ticket closed by ShopDeck
+      await raiseAlert({
+        type: "ticket_resolved",
+        ticket_id: t.ticketId,
+        title: `ShopDeck closed Ticket #${t.ticketId}`,
+        alertBody: hasChat
+          ? `Ticket #${t.ticketId} (${t.subject || "No Subject"}) was closed by ShopDeck. Please review and mark as solved if satisfied.`
+          : `⚠️ WARNING: Ticket #${t.ticketId} was closed by ShopDeck WITHOUT ANY CHAT DISCUSSION from the team.`,
+      });
+
       // Trigger AI resolution check
       await evaluateResolution(t.ticketId);
     }
@@ -224,16 +256,14 @@ async function persistNewMessagesAndAlert(messages: ScrapedMessage[]) {
     );
     if (error) console.error("Error inserting chat history:", error);
 
-    for (const m of toInsert) {
-      if (m.sender === "agent") {
-        await raiseAlert({
-          type: "new_agent_message",
-          ticket_id: m.ticketId,
-          title: `New message on ticket #${m.ticketId}`,
-          alertBody: m.message.slice(0, 140),
-        });
-      }
-    }
+    // Update tickets table to note that this ticket has messages
+    const newlyActiveTicketIds = Array.from(new Set(toInsert.map((m) => m.ticketId)));
+    await supabase
+      .from("tickets")
+      .update({ has_chat_messages: true })
+      .in("ticket_id", newlyActiveTicketIds);
+
+    // Note: per-message push notification alert is suppressed as requested ("no need to notify me on every new messages")
   }
 }
 
@@ -242,7 +272,7 @@ async function main() {
     const { tickets, messages } = await scrapeTicketsAndChat();
     console.log(`Scraped ${tickets.length} tickets and ${messages.length} messages.`);
 
-    await persistTicketsAndDetectTransitions(tickets);
+    await persistTicketsAndDetectTransitions(tickets, messages);
     await persistNewMessagesAndAlert(messages);
 
     await markScrapeResult("last_scrape_tickets_chat", true);

@@ -4,6 +4,9 @@ import type { RtoSummary } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
 
+/**
+ * Checks if an ISO timestamp is today in Indian Standard Time (Asia/Kolkata)
+ */
 function isTodayIst(isoString: string | null | undefined): boolean {
   if (!isoString) return false;
   const date = new Date(isoString);
@@ -21,6 +24,9 @@ function isTodayIst(isoString: string | null | undefined): boolean {
   return nowIst === itemIst;
 }
 
+/**
+ * Gets current hour in IST (0 to 23)
+ */
 function getIstHour(): number {
   const parts = new Intl.DateTimeFormat("en-US", {
     timeZone: "Asia/Kolkata",
@@ -31,6 +37,9 @@ function getIstHour(): number {
   return hourPart ? parseInt(hourPart.value, 10) : new Date().getHours();
 }
 
+/**
+ * Gets formatted IST time string e.g. "09:15 PM"
+ */
 function getFormattedIstTime(): string {
   return new Intl.DateTimeFormat("en-US", {
     timeZone: "Asia/Kolkata",
@@ -42,72 +51,57 @@ function getFormattedIstTime(): string {
 
 export async function GET() {
   try {
-    const [
-      alertsRes,
-      ndrOrdersRes,
-      ndrLogsRes,
-      allRtoOrdersRes,
-      inwardEntriesRes,
-      inwardLogsRes,
-      intransitHistoryRes,
-      ticketsRes,
-      settingsRes,
-    ] = await Promise.all([
-      supabaseServer
-        .from("alerts")
-        .select("*")
-        .order("created_at", { ascending: false })
-        .limit(20),
-      supabaseServer.from("orders").select("awb_number").ilike("order_status", "%ndr%"),
-      supabaseServer.from("ndr_logs").select("awb_number, called_at"),
-      supabaseServer.from("orders").select("*").not("rto_status", "is", null),
-      supabaseServer.from("rto_inward_entries").select("*"),
-      supabaseServer.from("rto_inward_log").select("*"),
-      supabaseServer
-        .from("rto_intransit_history")
-        .select("*")
-        .eq("disappeared_without_delivery", true),
-      supabaseServer.from("tickets").select("*"),
-      supabaseServer.from("settings").select("key, value"),
-    ]);
+    const [settingsRes, ordersRes, inwardEntriesRes, inwardLogsRes, intransitHistoryRes] =
+      await Promise.all([
+        supabaseServer.from("settings").select("key, value"),
+        supabaseServer.from("orders").select("*").not("rto_status", "is", null),
+        supabaseServer.from("rto_inward_entries").select("*"),
+        supabaseServer.from("rto_inward_log").select("*"),
+        supabaseServer
+          .from("rto_intransit_history")
+          .select("*")
+          .eq("disappeared_without_delivery", true),
+      ]);
 
     const settingsMap = Object.fromEntries(
       (settingsRes.data || []).map((s) => [s.key, s.value])
     );
 
-    // Calculate pending NDRs (orders that have not been logged today)
-    const calledTodayAwbs = new Set<string>();
-    for (const log of ndrLogsRes.data || []) {
-      if (isTodayIst(log.called_at)) {
-        calledTodayAwbs.add(log.awb_number);
-      }
-    }
-    const pendingNdr = (ndrOrdersRes.data || []).filter(
-      (o) => !calledTodayAwbs.has(o.awb_number)
-    ).length;
-
-    // RTO calculations
     const initialBaseline = parseInt(settingsMap["rto_initial_total"] || "0", 10) || 0;
-    const allRtoOrders = allRtoOrdersRes.data || [];
+    const allRtoOrders = ordersRes.data || [];
+
+    // Intransit parcels
     const intransitOrders = allRtoOrders.filter((o) =>
       ["RTO_IN_TRANSIT", "RTO_INITIATED", "IN_TRANSIT"].includes(o.rto_status || "")
     );
+
+    // Delivered RTOs
     const deliveredOrders = allRtoOrders.filter((o) =>
       ["RTO_DELIVERED", "DELIVERED"].includes(o.rto_status || "")
     );
+
+    // Delivered Today (using delivered_at or last_seen_at if marked delivered today)
     const deliveredTodayOrders = deliveredOrders.filter(
       (o) => isTodayIst(o.delivered_at) || isTodayIst(o.last_seen_at)
     );
 
+    // Inwarded entries today
     const inwardEntries = inwardEntriesRes.data || [];
     const inwardEntriesToday = inwardEntries.filter((e) => isTodayIst(e.created_at));
     const inwardedAwbsToday = new Set(inwardEntriesToday.map((e) => e.awb_number));
-    for (const log of inwardLogsRes.data || []) {
+
+    // Also include inward_log scanned today
+    const inwardLogs = inwardLogsRes.data || [];
+    for (const log of inwardLogs) {
       if (isTodayIst(log.scanned_at)) {
         inwardedAwbsToday.add(log.awb_number);
       }
     }
 
+    const istHour = getIstHour();
+    const isAfter7Pm = istHour >= 19; // 19:00 is 7:00 PM IST
+
+    // Find missing delivered AWBs: ShopDeck says delivered today, but user has not inwarded today
     const missingDeliveredAwbs: string[] = [];
     for (const order of deliveredTodayOrders) {
       if (!inwardedAwbsToday.has(order.awb_number)) {
@@ -115,15 +109,18 @@ export async function GET() {
       }
     }
 
+    // In-transit dropped AWBs
     const intransitDroppedAwbs = (intransitHistoryRes.data || []).map((h) => h.awb_number);
-    const isAfter7Pm = getIstHour() >= 19;
+
+    const totalRto = initialBaseline + allRtoOrders.length;
     const deliveredTodayCount = deliveredTodayOrders.length;
     const inwardedTodayCount = inwardedAwbsToday.size;
+
     const reconciliationMismatch =
       isAfter7Pm && (missingDeliveredAwbs.length > 0 || inwardedTodayCount !== deliveredTodayCount);
 
-    const rtoSummary: RtoSummary = {
-      totalRto: initialBaseline + allRtoOrders.length,
+    const summary: RtoSummary = {
+      totalRto,
       initialBaseline,
       newRtoCount: allRtoOrders.length,
       intransitCount: intransitOrders.length,
@@ -136,27 +133,9 @@ export async function GET() {
       intransitDroppedAwbs,
     };
 
-    // Tickets needing review or action
-    const allTickets = ticketsRes.data || [];
-    const ticketsNeedingReview = allTickets.filter(
-      (t) => (t.user_status !== "solved" && t.status === "closed") || t.ai_resolution_flag === "needs_review"
-    ).length;
-
-    return NextResponse.json({
-      alerts: alertsRes.data || [],
-      counts: {
-        pendingNdr,
-        pendingRtoInward: missingDeliveredAwbs.length,
-        ticketsNeedingReview,
-      },
-      rtoSummary,
-      lastScrapeOrdersNdr: settingsMap["last_scrape_orders_ndr"] || null,
-      lastScrapeTicketsChat: settingsMap["last_scrape_tickets_chat"] || null,
-      lastScrapeOk: settingsMap["last_scrape_ok"] !== "false",
-    });
+    return NextResponse.json(summary);
   } catch (err: any) {
-    console.error("Dashboard summary error:", err);
+    console.error("RTO summary error:", err);
     return NextResponse.json({ error: err.message }, { status: 500 });
   }
 }
-

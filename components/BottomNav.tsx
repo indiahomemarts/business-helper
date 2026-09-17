@@ -8,6 +8,7 @@ const TABS = [
   { href: "/ndr", label: "NDR", icon: PhoneIcon },
   { href: "/rto", label: "RTO", icon: BoxIcon },
   { href: "/tickets", label: "Tickets", icon: ChatIcon },
+  { href: "/messages", label: "Messages", icon: MessageIcon },
   { href: "/settings", label: "Settings", icon: GearIcon },
 ];
 
@@ -72,6 +73,13 @@ function ChatIcon({ active }: { active?: boolean }) {
   return (
     <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke={iconColor(active)} strokeWidth="1.8">
       <path d="M4 5h16v10H8l-4 4V5Z" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+function MessageIcon({ active }: { active?: boolean }) {
+  return (
+    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke={iconColor(active)} strokeWidth="1.8">
+      <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" strokeLinecap="round" strokeLinejoin="round" />
     </svg>
   );
 }

@@ -116,7 +116,7 @@ In your GitHub repo: **Settings → Secrets and variables → Actions → New re
 | `SUPABASE_URL` | same as Step 1 |
 | `SUPABASE_SERVICE_ROLE_KEY` | same as Step 1 |
 | `INTERNAL_API_SECRET` | same as Step 2 |
-| `APP_URL` | your Vercel URL from Step 5, **no trailing slash** |
+| `   ` | your Vercel URL from Step 5, **no trailing slash** |
 
 The three workflows in `.github/workflows/` will now run automatically on
 their schedules. You can also trigger any of them manually from the
@@ -211,4 +211,4 @@ push notifications end-to-end, the login gate.
 **Will need a short back-and-forth after your first deploy:** the exact
 CSS selectors in `scraper/src/scrape*.ts` (Step 9 above) — this was always
 going to be true for any scraper built without access to your live account,
-regardless of who builds it.
+regardless of who builds it

@@ -50,14 +50,15 @@ async function callGeminiJson<T>(systemInstruction: string, userPrompt: string):
 
 const BUSINESS_PARTNER_PERSONA = `
 You are acting as the seller's business partner, not a generic customer-support
-bot. You help a small D2C chocolate seller on the ShopDeck platform deal with
-their support agents. Prioritize the seller's business security, evidence,
+bot. You help an Indian D2C seller on the ShopDeck platform deal with
+their support agents and logistics issues. Prioritize the seller's business security, evidence,
 and cost -- e.g. never suggest agreeing to something that waives the seller's
 right to compensation without saying so explicitly, and flag anything that
 looks like it needs the seller's own judgment rather than a quick reply.
-Keep language simple and direct. When asked for a Gujarati summary, write in
-plain, everyday Gujarati (not overly formal/literary), as a business partner
-would explain it out loud to the seller.
+Keep language simple and direct.
+
+CRITICAL TONE & LANGUAGE INSTRUCTION FOR GUJARATI:
+When providing a Gujarati conclusion or summary, ALWAYS write in natural Gujarati-English mix (Gujlish) in Latin or Gujarati script, exactly like WhatsApp chatting between business partners in Gujarat (e.g. "ShopDeck team ae kidhu che ke parcel return dispatch thai gayu che, 24 hours ma tracking live thashe. Have wait karvanu che." or "Aa ticket ma agent ae reply nathi aapyu ane direct close kari didhi che. Dispute raise karvo padshe.").
 `.trim();
 
 export interface SummaryResult {
@@ -68,13 +69,14 @@ export interface SummaryResult {
 
 /**
  * Summarize the latest agent message (in the context of the thread so far)
- * into a short Gujarati summary + conclusion, and propose 2-3 reply drafts.
+ * into a short Gujarati-English (Gujlish) WhatsApp style summary + conclusion,
+ * and propose 2-3 reply drafts.
  */
 export async function summarizeAndSuggestReplies(
   rollingSummary: string | null,
   recentMessages: { sender: string; message: string }[]
 ): Promise<SummaryResult> {
-  const thread = recentMessages.map((m) => `${m.sender}: ${m.message}`).join("\n");
+  const thread = recentMessages.map((m) => `${m.sender === "seller" ? "You told" : "ShopDeck team said"}: ${m.message}`).join("\n");
 
   const prompt = `
 Context so far (rolling summary of the thread, may be empty if this is new):
@@ -85,13 +87,74 @@ ${thread}
 
 Respond with ONLY a JSON object in this exact shape, nothing else:
 {
-  "summary_gujarati": "2-3 sentence plain Gujarati summary of what the agent is saying",
-  "conclusion_gujarati": "one short sentence: what does this actually mean for the seller / what do they need to do",
-  "reply_suggestions": ["short professional reply option 1", "short professional reply option 2", "short professional reply option 3"]
+  "summary_gujarati": "2-3 short sentences in natural WhatsApp-style Gujarati-English mix (Gujlish) explaining what is happening in the conversation",
+  "conclusion_gujarati": "1 short crisp sentence in WhatsApp-style Gujarati-English mix (Gujlish) stating what the bottom-line conclusion is / what action is required",
+  "reply_suggestions": ["short professional reply option 1 in English", "short professional reply option 2 in English", "short professional reply option 3 in English"]
 }
 `.trim();
 
   return callGeminiJson<SummaryResult>(BUSINESS_PARTNER_PERSONA, prompt);
+}
+
+/**
+ * Generate a single WhatsApp-style Gujarati-English mix conclusion for any message or thread
+ */
+export async function getWhatsAppStyleConclusion(
+  messages: Array<{ sender: string; message: string }>
+): Promise<string> {
+  const thread = messages.map((m) => `${m.sender === "seller" ? "You told" : "ShopDeck team said"}: ${m.message}`).join("\n");
+
+  const prompt = `
+Here is a conversation on ShopDeck:
+${thread}
+
+Give ONLY a single short conclusion sentence in natural WhatsApp-style Gujarati-English mix (Gujlish) like partners chatting on WhatsApp (e.g. "Team ae inquiry forward kari che, 24 hours ma status malvanu che.")
+
+Respond with ONLY a JSON object:
+{ "conclusion": "your short Gujlish sentence here" }
+`.trim();
+
+  const result = await callGeminiJson<{ conclusion: string }>(BUSINESS_PARTNER_PERSONA, prompt);
+  return result.conclusion;
+}
+
+/**
+ * Translates an English support message or chat into Gujarati
+ */
+export async function translateMessageToGujarati(text: string): Promise<string> {
+  const prompt = `
+Translate the following support/business text into clear, easy-to-understand conversational Gujarati:
+
+"${text}"
+
+Respond with ONLY a JSON object:
+{ "translation": "Gujarati translation here" }
+`.trim();
+
+  const result = await callGeminiJson<{ translation: string }>(BUSINESS_PARTNER_PERSONA, prompt);
+  return result.translation;
+}
+
+/**
+ * Generates 2-3 professional response options in English to send back to the ShopDeck team
+ */
+export async function generateChatReplyDraft(
+  messages: Array<{ sender: string; message: string }>
+): Promise<string[]> {
+  const thread = messages.map((m) => `${m.sender === "seller" ? "You" : "ShopDeck Agent"}: ${m.message}`).join("\n");
+
+  const prompt = `
+Based on this chat history with the ShopDeck team:
+${thread}
+
+Draft 3 distinct, professional, and firm reply options in English that protect the seller's interests (e.g. asking for proof of delivery, disputing wrong status, requesting escalation).
+
+Respond with ONLY a JSON object:
+{ "replies": ["reply draft 1", "reply draft 2", "reply draft 3"] }
+`.trim();
+
+  const result = await callGeminiJson<{ replies: string[] }>(BUSINESS_PARTNER_PERSONA, prompt);
+  return result.replies || [];
 }
 
 export interface ResolutionResult {
@@ -102,11 +165,6 @@ export interface ResolutionResult {
 /**
  * Called when a ticket transitions to closed. Asks whether the conversation
  * shows a genuine resolution or looks like it was closed without one.
- *
- * IMPORTANT: this is a triage aid, not a certainty machine. Treat "resolved"
- * as "looks fine, low priority to double check" and "needs_review" as
- * "flag for the seller to read personally" -- never suppress the underlying
- * ticket data based on this flag alone.
  */
 export async function evaluateResolution(
   fullThreadText: string
@@ -133,8 +191,7 @@ Respond with ONLY a JSON object in this exact shape, nothing else:
 
 /**
  * Rolls new messages into the existing summary so we never have to replay
- * the full raw history on every call. Call this after fetching new messages
- * for a ticket, before calling summarizeAndSuggestReplies for the next one.
+ * the full raw history on every call.
  */
 export async function updateRollingSummary(
   previousSummary: string | null,
